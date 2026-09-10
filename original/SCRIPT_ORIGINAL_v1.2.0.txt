@@ -1,0 +1,302 @@
+// ==UserScript==
+// @name         Nexus Ciclos - Compra da Semana e Ticket Médio
+// @namespace    nexus-gestao-pro
+// @version      1.2.0
+// @description  Captura Semana, Região, Total e Ticket Médio do Relatório de Cobranças e envia ao Firebase para o CICLOS_V3.
+// @match        https://sistema.romancemoda.com.br/apex/*
+// @grant        GM_addStyle
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const FIREBASE_DB = 'https://acompanhamentos-reta-final-default-rtdb.firebaseio.com';
+  const BASE = 'Ciclo-semanas-integracao';
+
+  const state = { lastRequest: null, data: [] };
+  const PANEL_HIDDEN_KEY = 'nexusCompraTicketPanelHidden';
+
+  function normalize(value) {
+    return String(value || '')
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  }
+  function canonical(value) {
+    return normalize(value)
+      .replace(/^(regiao|setor)\s+/,'')
+      .replace(/\s+(ac|al|ap|am|ba|ce|df|es|go|ma|mt|ms|mg|pa|pb|pr|pe|pi|rj|rn|rs|ro|rr|sc|sp|se|to)$/,'')
+      .trim();
+  }
+  function profileKey(profile) {
+    const normalized = String(profile || 'perfil').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+      .replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g,'') || 'perfil';
+    let hash = 2166136261;
+    for (const ch of String(profile || '')) { hash ^= ch.charCodeAt(0); hash = Math.imul(hash, 16777619); }
+    return `${normalized}_${(hash >>> 0).toString(36)}`;
+  }
+  function weekNumber(value) {
+    const m = String(value || '').match(/(\d+)/);
+    return m ? Number(m[1]) : 0;
+  }
+  function money(value) {
+    const clean = String(value || '').replace(/\s/g,'').replace(/R\$/gi,'');
+    if (!clean) return NaN;
+    if (clean.includes(',') && clean.includes('.')) return Number(clean.replace(/\./g,'').replace(',','.'));
+    if (clean.includes(',')) return Number(clean.replace(/\./g,'').replace(',','.'));
+    return Number(clean.replace(/[^\d.-]/g,''));
+  }
+  async function fb(method, path, body) {
+    const res = await fetch(`${FIREBASE_DB}/${path}.json`, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body)
+    });
+    if (!res.ok) throw new Error(`Firebase HTTP ${res.status}`);
+    return res.json();
+  }
+
+  // Mapeamento específico do Oracle APEX desta página.
+  // Nesta página os nomes das colunas aparecem no atributo "headers" das células,
+  // e alguns cabeçalhos usam IDs técnicos. Por isso não dependemos apenas de thead.
+  const COLUMN_ALIASES = {
+    week: ['SEMANA'],
+    region: ['REGIAO', 'REGIÃO'],
+    total: ['TOTALGERAL'],
+    ticket: ['C5407196655334160411']
+  };
+
+  function normalizeHeader(value) {
+    return String(value || '')
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      .replace(/\s+/g, ' ').trim().toUpperCase();
+  }
+
+  function headerTokens(cell) {
+    return String(cell?.getAttribute('headers') || '')
+      .split(/\s+/)
+      .map(x => normalizeHeader(x))
+      .filter(Boolean);
+  }
+
+  function cellByHeader(row, aliases) {
+    const wanted = aliases.map(normalizeHeader);
+    return [...row.querySelectorAll('td')].find(td => {
+      const tokens = headerTokens(td);
+      return tokens.some(token => wanted.includes(token));
+    }) || null;
+  }
+
+  function findReportTable() {
+    // Primeiro procura uma tabela que tenha células com os IDs reais da grade APEX.
+    const tables = [...document.querySelectorAll('table')];
+    const exact = tables.find(table => {
+      const rows = [...table.querySelectorAll('tbody tr')];
+      return rows.some(tr =>
+        cellByHeader(tr, COLUMN_ALIASES.week) &&
+        cellByHeader(tr, COLUMN_ALIASES.region) &&
+        cellByHeader(tr, COLUMN_ALIASES.total) &&
+        cellByHeader(tr, COLUMN_ALIASES.ticket)
+      );
+    });
+    if (exact) return exact;
+
+    // Fallback: encontra os cabeçalhos pelo texto, inclusive quando o APEX recriar a grade.
+    return tables.find(table => {
+      const headers = [...table.querySelectorAll('thead th')]
+        .map(th => normalizeHeader(th.innerText || th.textContent));
+      return headers.some(h => h === 'SEMANA') &&
+        headers.some(h => h === 'REGIAO') &&
+        headers.some(h => h === 'TOTAL') &&
+        headers.some(h => h.includes('TICKET MEDIO'));
+    }) || null;
+  }
+
+  function extractData() {
+    const table = findReportTable();
+    if (!table) {
+      const diagnostic = [...document.querySelectorAll('table')].map((t, i) => {
+        const h = [...t.querySelectorAll('thead th')].map(th => (th.innerText || th.textContent || '').trim()).filter(Boolean);
+        return `Tabela ${i + 1}: ${h.slice(0, 8).join(' | ')}`;
+      }).join(' || ');
+      throw new Error('Não encontrei a grade APEX com Semana, Região, Total e Ticket Médio. ' + (diagnostic || 'Nenhuma tabela visível foi encontrada.'));
+    }
+
+    const headerTexts = [...table.querySelectorAll('thead th')].map(th => normalizeHeader(th.innerText || th.textContent));
+    const idxWeek = headerTexts.findIndex(h => h === 'SEMANA');
+    const idxRegion = headerTexts.findIndex(h => h === 'REGIAO');
+    const idxTotal = headerTexts.findIndex(h => h === 'TOTAL');
+    const idxTicket = headerTexts.findIndex(h => h.includes('TICKET MEDIO'));
+
+    const rows = [...table.querySelectorAll('tbody tr')];
+    const data = rows.map(tr => {
+      // Caminho principal: IDs/atributo headers reais da página mapeada.
+      const weekCell = cellByHeader(tr, COLUMN_ALIASES.week);
+      const regionCell = cellByHeader(tr, COLUMN_ALIASES.region);
+      const totalCell = cellByHeader(tr, COLUMN_ALIASES.total);
+      const ticketCell = cellByHeader(tr, COLUMN_ALIASES.ticket);
+
+      // Fallback para a ordem visual caso o APEX remova os atributos headers.
+      const cells = [...tr.querySelectorAll('td')];
+      const w = weekCell || cells[idxWeek];
+      const r = regionCell || cells[idxRegion];
+      const t = totalCell || cells[idxTotal];
+      const tk = ticketCell || cells[idxTicket];
+
+      const week = weekNumber(w?.innerText || w?.textContent);
+      const region = String(r?.innerText || r?.textContent || '').replace(/\s+/g, ' ').trim();
+      const total = money(t?.innerText || t?.textContent);
+      const ticketMedio = money(tk?.innerText || tk?.textContent);
+
+      if (!week || !region || !Number.isFinite(total) || !Number.isFinite(ticketMedio)) return null;
+      return {
+        week,
+        region,
+        regionKey: canonical(region),
+        total,
+        ticketMedio,
+        key: `${week}|${canonical(region)}`
+      };
+    }).filter(Boolean);
+
+    if (!data.length) {
+      throw new Error('A grade foi encontrada, mas nenhuma linha válida foi extraída. Aguarde a tabela terminar de carregar e tente novamente.');
+    }
+    state.data = data;
+    renderStatus(`${data.length} linhas capturadas. Semanas: ${[...new Set(data.map(x => x.week))].sort((a,b) => a-b).join(', ')}`);
+    return data;
+  }
+
+  function makePayload(request) {
+    const wantedWeeks = Array.isArray(request?.targetWeeks) ? request.targetWeeks.map(Number) : null;
+    const mappings = Array.isArray(request?.mappings) ? request.mappings : [];
+    const metrics = {};
+    const source = state.data.length ? state.data : extractData();
+
+    for (const row of source) {
+      if (wantedWeeks && wantedWeeks.length && !wantedWeeks.includes(row.week)) continue;
+      metrics[row.key] = { total: row.total, ticketMedio: row.ticketMedio, region: row.region, sourceWeek: row.week };
+    }
+
+    // Garante associação usando exatamente as combinações que o Nexus solicitou.
+    for (const map of mappings) {
+      const wk = Number(map.sourceWeek);
+      const sectorKey = canonical(map.sector);
+      const found = source.find(r => r.week === wk && r.regionKey === sectorKey);
+      if (found) metrics[`${wk}|${sectorKey}`] = { total: found.total, ticketMedio: found.ticketMedio, region: found.region, sourceWeek: wk };
+    }
+    return metrics;
+  }
+
+  async function checkRequest() {
+    const profile = document.getElementById('nexusProfile').value.trim();
+    if (!profile) throw new Error('Informe o mesmo nome do perfil selecionado no Nexus.');
+    const key = profileKey(profile);
+    const req = await fb('GET', `${BASE}/requests/${key}`);
+    if (!req || !req.requestId || req.status !== 'pending') throw new Error('Nenhuma solicitação pendente para este perfil.');
+    state.lastRequest = req;
+    renderStatus(`Solicitação encontrada para ${req.profile}. Semanas de origem: ${(req.targetWeeks || []).join(', ') || 'todas'}.`);
+    return req;
+  }
+
+  async function sendRequest() {
+    const req = state.lastRequest || await checkRequest();
+    if (!state.data.length) extractData();
+    const metrics = makePayload(req);
+    if (!Object.keys(metrics).length) throw new Error('Nenhuma linha encontrada para as semanas solicitadas.');
+    const payload = {
+      version: 2,
+      type: 'purchaseMetrics',
+      requestId: req.requestId,
+      profile: req.profile,
+      profileKey: req.profileKey,
+      requestedAt: req.requestedAt,
+      createdAt: Date.now(),
+      status: 'ready',
+      source: 'tampermonkey-relatorio-cobrancas',
+      metrics,
+      rowsCaptured: state.data.length
+    };
+    await fb('PUT', `${BASE}/results/${req.profileKey}`, payload);
+    await fb('PATCH', `${BASE}/requests/${req.profileKey}`, { status: 'completed', completedAt: Date.now() });
+    renderStatus(`Enviado com sucesso: ${Object.keys(metrics).length} combinações de Semana + Região.`);
+  }
+
+  function setPanelHidden(hidden) {
+    const box = document.getElementById('nexusTmPanel');
+    const opener = document.getElementById('nexusTmOpen');
+    if (!box || !opener) return;
+
+    box.classList.toggle('is-hidden', hidden);
+    opener.classList.toggle('is-visible', hidden);
+    try { localStorage.setItem(PANEL_HIDDEN_KEY, hidden ? '1' : '0'); } catch (_) {}
+  }
+
+  function panel() {
+    if (document.getElementById('nexusTmPanel')) return;
+
+    const box = document.createElement('div');
+    box.id = 'nexusTmPanel';
+    box.innerHTML = `
+      <div class="nexus-head">
+        <span>Nexus • Compra & Ticket</span>
+        <button id="nexusHide" class="nexus-hide" type="button" title="Ocultar painel">− Ocultar</button>
+      </div>
+      <label>Perfil do Nexus</label>
+      <input id="nexusProfile" placeholder="Ex.: Luciana Kelma">
+      <div class="nexus-actions">
+        <button id="nexusCapture">1. Capturar tabela</button>
+        <button id="nexusCheck">2. Ver solicitação</button>
+        <button id="nexusSend" class="primary">3. Atender solicitação e enviar</button>
+      </div>
+      <div id="nexusTmStatus">Aguardando captura.</div>
+    `;
+
+    const opener = document.createElement('button');
+    opener.id = 'nexusTmOpen';
+    opener.type = 'button';
+    opener.title = 'Mostrar painel Nexus Compra & Ticket';
+    opener.innerHTML = '<span class="nexus-open-icon">↗</span><span>Compra & Ticket</span>';
+
+    document.body.appendChild(box);
+    document.body.appendChild(opener);
+
+    document.getElementById('nexusHide').onclick = () => setPanelHidden(true);
+    opener.onclick = () => setPanelHidden(false);
+    document.getElementById('nexusCapture').onclick = () => { try { extractData(); } catch(e) { renderStatus(e.message, true); } };
+    document.getElementById('nexusCheck').onclick = async () => { try { await checkRequest(); } catch(e) { renderStatus(e.message, true); } };
+    document.getElementById('nexusSend').onclick = async () => {
+      try { renderStatus('Enviando...'); await sendRequest(); } catch(e) { console.error(e); renderStatus(e.message, true); }
+    };
+
+    let hidden = false;
+    try { hidden = localStorage.getItem(PANEL_HIDDEN_KEY) === '1'; } catch (_) {}
+    setPanelHidden(hidden);
+  }
+  function renderStatus(text, error=false) {
+    const el = document.getElementById('nexusTmStatus');
+    if (el) { el.textContent = text; el.className = error ? 'error' : ''; }
+  }
+
+  GM_addStyle(`
+    #nexusTmPanel{position:fixed;right:18px;bottom:18px;z-index:2147483647;width:330px;padding:14px;border-radius:14px;background:#fff;color:#172033;box-shadow:0 12px 35px rgba(0,0,0,.25);font:13px Arial,sans-serif;transition:opacity .18s ease,transform .18s ease}
+    #nexusTmPanel.is-hidden{display:none!important}
+    #nexusTmPanel .nexus-head{font-size:15px;font-weight:700;margin-bottom:10px;display:flex;align-items:center;justify-content:space-between;gap:10px}
+    #nexusTmPanel .nexus-hide{padding:5px 8px!important;border-radius:7px!important;background:#f1f5f9!important;color:#526174!important;font-size:11px!important;font-weight:700!important;white-space:nowrap}
+    #nexusTmPanel .nexus-hide:hover{background:#e2e8f0!important;color:#172033!important}
+    #nexusTmOpen{display:none;position:fixed;right:18px;bottom:18px;z-index:2147483647;border:0;border-radius:999px;padding:10px 13px;background:#7c3aed;color:#fff;box-shadow:0 10px 28px rgba(0,0,0,.25);font:700 12px Arial,sans-serif;cursor:pointer;align-items:center;gap:7px}
+    #nexusTmOpen.is-visible{display:flex}
+    #nexusTmOpen:hover{filter:brightness(.96);transform:translateY(-1px)}
+    #nexusTmOpen .nexus-open-icon{font-size:15px;line-height:1}
+    #nexusTmPanel label{display:block;font-weight:600;margin-bottom:4px}
+    #nexusTmPanel input{box-sizing:border-box;width:100%;padding:9px;border:1px solid #ccd3df;border-radius:8px;margin-bottom:9px}
+    #nexusTmPanel .nexus-actions{display:grid;gap:7px}
+    #nexusTmPanel button{border:0;border-radius:8px;padding:9px;cursor:pointer;background:#e8edf5;color:#172033;font-weight:600}
+    #nexusTmPanel button.primary{background:#7c3aed;color:#fff}
+    #nexusTmStatus{margin-top:10px;padding-top:9px;border-top:1px solid #e5e7eb;color:#526174;line-height:1.35}
+    #nexusTmStatus.error{color:#b91c1c}
+  `);
+
+  // Espera a página APEX terminar de renderizar.
+  setTimeout(panel, 1500);
+})();

@@ -1,0 +1,18 @@
+LEIA PRIMEIRO
+=============
+
+Este pacote é para o SEGUNDO script: “Nexus Ciclos - Compra da Semana e Ticket Médio”.
+Ele é separado do repositório nexus-tampermonkey usado pela integração de Notas Perdidas.
+
+Repositório recomendado e já configurado nos loaders:
+jhonesfeliciano/nexus-compra-ticket
+
+NÃO misture os arquivos deste pacote dentro do repositório nexus-tampermonkey antigo.
+Use um novo repositório chamado nexus-compra-ticket.
+
+No Tampermonkey instale somente um loader desta pasta por ambiente:
+- TERESINA
+- PALMAS
+- MATRIZ
+
+Os arquivos de releases ficam no GitHub e NÃO são instalados diretamente no Tampermonkey.
