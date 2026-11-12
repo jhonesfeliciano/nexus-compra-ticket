@@ -4,14 +4,14 @@
   "repository": "jhonesfeliciano/nexus-compra-ticket",
   "channels": {
     "teresina": {
-      "version": "1.3.1",
-      "path": "releases/1.3.1/teresina/nexus-compra-ticket-teresina.js",
-      "sha256": "936d58bb805a149300547c8971309c1c0b42f719964086682e7ba0563a0e0eeb"
+      "version": "1.3.2",
+      "path": "releases/1.3.2/teresina/nexus-compra-ticket-teresina.js",
+      "sha256": "0ad6db2cc82f2a8de6ff0cd345bbbe25d693616c5a0b3bc18b52b97ac1030b21"
     },
     "palmas": {
-      "version": "1.3.1",
-      "path": "releases/1.3.1/palmas/nexus-compra-ticket-palmas.js",
-      "sha256": "c1e9ba4be4bcaf081dce2c3a63a87c6aa10683c12c03ef60bb4672ed2679de9f"
+      "version": "1.3.2",
+      "path": "releases/1.3.2/palmas/nexus-compra-ticket-palmas.js",
+      "sha256": "ca795c90c6db3121ef7850e5fce27e2994ba23686c94f89506a424ced8885811"
     }
   }
 }
